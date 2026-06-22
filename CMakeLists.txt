@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.19)
-project(empty-template LANGUAGES C CXX VERSION 0.0.1)
+project(advanced-query LANGUAGES C CXX VERSION 1.0.0)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -12,5 +12,6 @@ add_library(${PROJECT_NAME} SHARED main.cpp)
 
 target_link_libraries(${PROJECT_NAME} PRIVATE
     OMP-SDK
+    OMP-Network
 )
 
