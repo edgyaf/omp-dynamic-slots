@@ -67,6 +67,8 @@ private:
 	Impl::String initGameHostname_;
 	bool initGameHostnameActive_ = false;
 	bool networkHandlersRegistered_ = false;
+	bool warnedNoLegacyNetwork_ = false;
+	bool warnedQueryPatchFailed_ = false;
 
 public:
 	PROVIDE_UID(0x2EE35F58EC5C44D1);
@@ -323,12 +325,14 @@ private:
 		}
 
 		bool patched = false;
+		bool foundLegacyNetwork = false;
 		for (INetwork* network : core_->getNetworks())
 		{
 			if (!network || network->getNetworkType() != ENetworkType_RakNetLegacy)
 			{
 				continue;
 			}
+			foundLegacyNetwork = true;
 
 			uint16_t* queryMaxPlayers = findLegacyQueryMaxPlayers(*network);
 			if (!queryMaxPlayers)
@@ -341,13 +345,24 @@ private:
 			patched = true;
 		}
 
+		if (!foundLegacyNetwork && !warnedNoLegacyNetwork_)
+		{
+			core_->logLn(LogLevel::Warning, "Advanced Query could not find a RakNet legacy network to patch query slots.");
+			warnedNoLegacyNetwork_ = true;
+		}
+		else if (foundLegacyNetwork && !patched && !warnedQueryPatchFailed_)
+		{
+			core_->logLn(LogLevel::Warning, "Advanced Query could not locate LegacyNetwork query max players in this open.mp build.");
+			warnedQueryPatchFailed_ = true;
+		}
+
 		return patched;
 	}
 
 	uint16_t* findLegacyQueryMaxPlayers(INetwork& network) const
 	{
 		const uintptr_t expectedCore = reinterpret_cast<uintptr_t>(core_);
-		auto* bytes = reinterpret_cast<unsigned char*>(&network);
+		auto* bytes = static_cast<unsigned char*>(dynamic_cast<void*>(&network));
 		constexpr size_t ScanBytes = 65536;
 		constexpr size_t QueryHeaderSearchBytes = 256;
 		const uint16_t realMax = static_cast<uint16_t>(realMaxPlayers());
