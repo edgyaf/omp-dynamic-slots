@@ -386,7 +386,15 @@ private:
 			{ "ResetInitGameHostname", &ResetInitGameHostname },
 			{ "IsInitGameHostnameSet", &IsInitGameHostnameSet },
 		};
-		script.Register(natives, static_cast<int>(std::size(natives)));
+
+		for (const AMX_NATIVE_INFO& native : natives)
+		{
+			int index = 0;
+			if (script.FindNative(native.name, &index) != 0)
+			{
+				script.Register(&native, 1);
+			}
+		}
 	}
 
 	int realMaxPlayers() const
