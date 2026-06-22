@@ -348,18 +348,39 @@ private:
 	{
 		const uintptr_t expectedCore = reinterpret_cast<uintptr_t>(core_);
 		auto* bytes = reinterpret_cast<unsigned char*>(&network);
-		constexpr size_t ScanBytes = 4096;
+		constexpr size_t ScanBytes = 65536;
+		constexpr size_t QueryHeaderSearchBytes = 256;
+		const uint16_t realMax = static_cast<uint16_t>(realMaxPlayers());
+		const uint16_t currentValue = active_ ? advertisedSlots_ : realMax;
 
-		for (size_t offset = 0; offset + (sizeof(uintptr_t) * 4) < ScanBytes; offset += alignof(uintptr_t))
+		for (size_t offset = 0; offset + sizeof(uintptr_t) < ScanBytes; ++offset)
 		{
 			uintptr_t first;
-			uintptr_t second;
 			std::memcpy(&first, bytes + offset, sizeof(first));
-			std::memcpy(&second, bytes + offset + sizeof(uintptr_t), sizeof(second));
-
-			if (first == expectedCore && second == expectedCore)
+			if (first != expectedCore)
 			{
-				return reinterpret_cast<uint16_t*>(bytes + offset + (sizeof(uintptr_t) * 3));
+				continue;
+			}
+
+			const size_t searchEnd = std::min(offset + QueryHeaderSearchBytes, ScanBytes - sizeof(uint16_t));
+			for (size_t secondOffset = offset + 1; secondOffset + sizeof(uintptr_t) < searchEnd; ++secondOffset)
+			{
+				uintptr_t second;
+				std::memcpy(&second, bytes + secondOffset, sizeof(second));
+				if (second != expectedCore)
+				{
+					continue;
+				}
+
+				for (size_t candidateOffset = secondOffset + sizeof(uintptr_t); candidateOffset + sizeof(uint16_t) < searchEnd; ++candidateOffset)
+				{
+					uint16_t candidate;
+					std::memcpy(&candidate, bytes + candidateOffset, sizeof(candidate));
+					if (candidate == realMax || candidate == currentValue)
+					{
+						return reinterpret_cast<uint16_t*>(bytes + candidateOffset);
+					}
+				}
 			}
 		}
 
