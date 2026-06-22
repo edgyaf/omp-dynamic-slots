@@ -384,40 +384,25 @@ private:
 		const uintptr_t expectedCore = reinterpret_cast<uintptr_t>(core_);
 		auto* bytes = static_cast<unsigned char*>(dynamic_cast<void*>(&network));
 		const size_t scanBytes = readableMemoryLength(bytes, 65536);
-		constexpr size_t QueryHeaderSearchBytes = 64;
 		constexpr size_t QueryMaxPlayersOffset = sizeof(uintptr_t) + sizeof(uintptr_t);
 		const uint16_t realMax = static_cast<uint16_t>(realMaxPlayers());
 		const uint16_t currentValue = active_ ? static_cast<uint16_t>(std::clamp<int>(advertisedSlots_ + currentBotPlayers(), 0, realMax)) : realMax;
 
-		for (size_t offset = 0; offset + sizeof(uintptr_t) < scanBytes; ++offset)
+		for (size_t offset = 0; offset + QueryMaxPlayersOffset + sizeof(uint16_t) < scanBytes; ++offset)
 		{
-			uintptr_t first;
-			std::memcpy(&first, bytes + offset, sizeof(first));
-			if (first != expectedCore)
+			uintptr_t queryCore;
+			std::memcpy(&queryCore, bytes + offset, sizeof(queryCore));
+			if (queryCore != expectedCore)
 			{
 				continue;
 			}
 
-			const size_t searchEnd = std::min(offset + QueryHeaderSearchBytes, scanBytes - sizeof(uint16_t));
-			for (size_t secondOffset = offset + 1; secondOffset + sizeof(uintptr_t) < searchEnd; ++secondOffset)
+			const size_t candidateOffset = offset + QueryMaxPlayersOffset;
+			uint16_t candidate;
+			std::memcpy(&candidate, bytes + candidateOffset, sizeof(candidate));
+			if (candidate == realMax || candidate == currentValue)
 			{
-				uintptr_t second;
-				std::memcpy(&second, bytes + secondOffset, sizeof(second));
-				if (second != expectedCore)
-				{
-					continue;
-				}
-
-				const size_t candidateOffset = secondOffset + QueryMaxPlayersOffset;
-				if (candidateOffset + sizeof(uint16_t) < scanBytes)
-				{
-					uint16_t candidate;
-					std::memcpy(&candidate, bytes + candidateOffset, sizeof(candidate));
-					if (candidate == realMax || candidate == currentValue)
-					{
-						return reinterpret_cast<uint16_t*>(bytes + candidateOffset);
-					}
-				}
+				return reinterpret_cast<uint16_t*>(bytes + candidateOffset);
 			}
 		}
 
