@@ -10,8 +10,14 @@
 #include <array>
 #include <cstdint>
 #include <cstring>
+#include <fstream>
 #include <limits>
+#include <sstream>
 #include <string>
+
+#if OMP_BUILD_PLATFORM == OMP_WINDOWS
+#include <Windows.h>
+#endif
 
 #include <Server/Components/Pawn/pawn.hpp>
 #include <Server/Components/Pawn/Impl/pawn_natives.hpp>
@@ -113,7 +119,7 @@ public:
 	void onLoad(ICore* core) override
 	{
 		core_ = core;
-		core_->getPlayers().getPlayerConnectDispatcher().addEventHandler(this);
+		core_->getPlayers().getPlayerConnectDispatcher().addEventHandler(this, EventPriority_Lowest);
 		setAmxLookups(core_);
 	}
 
@@ -334,15 +340,14 @@ private:
 			}
 			foundLegacyNetwork = true;
 
-			uint16_t* queryMaxPlayers = findLegacyQueryMaxPlayers(*network);
-			if (!queryMaxPlayers)
+			if (uint16_t* queryMaxPlayers = findLegacyQueryMaxPlayers(*network))
 			{
-				continue;
+				*queryMaxPlayers = static_cast<uint16_t>(slots);
+				network->update();
+				patched = true;
 			}
 
-			*queryMaxPlayers = static_cast<uint16_t>(slots);
-			network->update();
-			patched = true;
+			patched = patchLegacyQueryInfoBuffer(*network, static_cast<uint16_t>(slots)) || patched;
 		}
 
 		if (!foundLegacyNetwork && !warnedNoLegacyNetwork_)
@@ -352,7 +357,7 @@ private:
 		}
 		else if (foundLegacyNetwork && !patched && !warnedQueryPatchFailed_)
 		{
-			core_->logLn(LogLevel::Warning, "Advanced Query could not locate LegacyNetwork query max players in this open.mp build.");
+			core_->logLn(LogLevel::Warning, "Advanced Query could not locate LegacyNetwork query data in this open.mp build.");
 			warnedQueryPatchFailed_ = true;
 		}
 
@@ -364,9 +369,8 @@ private:
 		const uintptr_t expectedCore = reinterpret_cast<uintptr_t>(core_);
 		auto* bytes = static_cast<unsigned char*>(dynamic_cast<void*>(&network));
 		constexpr size_t ScanBytes = 65536;
-		constexpr size_t QueryHeaderSearchBytes = 256;
-		const uint16_t realMax = static_cast<uint16_t>(realMaxPlayers());
-		const uint16_t currentValue = active_ ? advertisedSlots_ : realMax;
+		constexpr size_t QueryHeaderSearchBytes = 64;
+		constexpr size_t QueryMaxPlayersOffset = sizeof(uintptr_t) + sizeof(uintptr_t);
 
 		for (size_t offset = 0; offset + sizeof(uintptr_t) < ScanBytes; ++offset)
 		{
@@ -387,19 +391,128 @@ private:
 					continue;
 				}
 
-				for (size_t candidateOffset = secondOffset + sizeof(uintptr_t); candidateOffset + sizeof(uint16_t) < searchEnd; ++candidateOffset)
+				const size_t candidateOffset = secondOffset + QueryMaxPlayersOffset;
+				if (candidateOffset + sizeof(uint16_t) < ScanBytes)
 				{
-					uint16_t candidate;
-					std::memcpy(&candidate, bytes + candidateOffset, sizeof(candidate));
-					if (candidate == realMax || candidate == currentValue)
-					{
-						return reinterpret_cast<uint16_t*>(bytes + candidateOffset);
-					}
+					return reinterpret_cast<uint16_t*>(bytes + candidateOffset);
 				}
 			}
 		}
 
 		return nullptr;
+	}
+
+	bool patchLegacyQueryInfoBuffer(INetwork& network, uint16_t slots) const
+	{
+		auto* bytes = static_cast<unsigned char*>(dynamic_cast<void*>(&network));
+		constexpr size_t ScanBytes = 65536;
+		constexpr size_t MinInfoBufferSize = 16;
+		constexpr size_t MaxInfoBufferSize = 4096;
+		constexpr size_t QueryTypeOffset = 10;
+		constexpr size_t QueryPasswordedOffset = 11;
+		constexpr size_t QueryPlayerCountOffset = 12;
+		constexpr size_t QueryMaxPlayersOffset = 14;
+
+		bool patched = false;
+		for (size_t offset = 0; offset + sizeof(uintptr_t) + sizeof(size_t) < ScanBytes; ++offset)
+		{
+			uintptr_t pointerValue = 0;
+			std::memcpy(&pointerValue, bytes + offset, sizeof(pointerValue));
+			auto* buffer = reinterpret_cast<unsigned char*>(pointerValue);
+
+			size_t bufferLength = 0;
+			std::memcpy(&bufferLength, bytes + offset + sizeof(pointerValue), sizeof(bufferLength));
+			if (bufferLength < MinInfoBufferSize || bufferLength > MaxInfoBufferSize)
+			{
+				continue;
+			}
+			if (!isReadableMemory(buffer, bufferLength))
+			{
+				continue;
+			}
+			if (buffer[QueryTypeOffset] != 'i' || buffer[QueryPasswordedOffset] > 1)
+			{
+				continue;
+			}
+
+			uint16_t playerCount = 0;
+			std::memcpy(&playerCount, buffer + QueryPlayerCountOffset, sizeof(playerCount));
+			if (playerCount > slots)
+			{
+				continue;
+			}
+
+			std::memcpy(buffer + QueryMaxPlayersOffset, &slots, sizeof(slots));
+			patched = true;
+		}
+
+		return patched;
+	}
+
+	bool isReadableMemory(const void* address, size_t length) const
+	{
+		if (!address || length == 0)
+		{
+			return false;
+		}
+
+#if OMP_BUILD_PLATFORM == OMP_WINDOWS
+		MEMORY_BASIC_INFORMATION mbi {};
+		if (!VirtualQuery(address, &mbi, sizeof(mbi)))
+		{
+			return false;
+		}
+
+		const auto start = reinterpret_cast<uintptr_t>(address);
+		const auto regionStart = reinterpret_cast<uintptr_t>(mbi.BaseAddress);
+		const auto regionEnd = regionStart + mbi.RegionSize;
+		if (mbi.State != MEM_COMMIT || start < regionStart || start + length > regionEnd)
+		{
+			return false;
+		}
+
+		const DWORD protect = mbi.Protect & 0xff;
+		return protect == PAGE_READONLY
+			|| protect == PAGE_READWRITE
+			|| protect == PAGE_WRITECOPY
+			|| protect == PAGE_EXECUTE_READ
+			|| protect == PAGE_EXECUTE_READWRITE
+			|| protect == PAGE_EXECUTE_WRITECOPY;
+#else
+		std::ifstream maps("/proc/self/maps");
+		if (!maps)
+		{
+			return false;
+		}
+
+		const auto start = reinterpret_cast<uintptr_t>(address);
+		const auto end = start + length;
+		Impl::String line;
+		while (std::getline(maps, line))
+		{
+			std::istringstream stream(line);
+			Impl::String range;
+			Impl::String perms;
+			if (!(stream >> range >> perms))
+			{
+				continue;
+			}
+
+			const size_t dash = range.find('-');
+			if (dash == Impl::String::npos)
+			{
+				continue;
+			}
+
+			const uintptr_t regionStart = static_cast<uintptr_t>(std::stoull(range.substr(0, dash), nullptr, 16));
+			const uintptr_t regionEnd = static_cast<uintptr_t>(std::stoull(range.substr(dash + 1), nullptr, 16));
+			if (start >= regionStart && end <= regionEnd)
+			{
+				return !perms.empty() && perms[0] == 'r' && perms.size() > 1 && perms[1] == 'w';
+			}
+		}
+		return false;
+#endif
 	}
 
 	bool readPlayerInit(NetworkBitStream& bs, PlayerInitData& data) const
