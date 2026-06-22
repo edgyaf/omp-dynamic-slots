@@ -76,6 +76,7 @@ private:
 	IPawnComponent* pawn_ = nullptr;
 	uint16_t requestedSlots_ = 0;
 	uint16_t advertisedSlots_ = 0;
+	uint16_t patchedInternalSlots_ = 0;
 	bool active_ = false;
 	Impl::String initGameHostname_;
 	bool initGameHostnameActive_ = false;
@@ -225,6 +226,7 @@ public:
 		active_ = false;
 		requestedSlots_ = 0;
 		advertisedSlots_ = 0;
+		patchedInternalSlots_ = 0;
 		applyAdvertisedSlotsOrRetry(publicMaxPlayersLimit());
 	}
 
@@ -405,7 +407,8 @@ private:
 
 			if (uint16_t* queryMaxPlayers = findLegacyQueryMaxPlayers(*network))
 			{
-				*queryMaxPlayers = static_cast<uint16_t>(internalSlots);
+				patchedInternalSlots_ = static_cast<uint16_t>(internalSlots);
+				*queryMaxPlayers = patchedInternalSlots_;
 				network->update();
 				patched = true;
 			}
@@ -452,7 +455,8 @@ private:
 		const uintptr_t expectedCore = reinterpret_cast<uintptr_t>(core_);
 		constexpr size_t QueryMaxPlayersOffset = sizeof(uintptr_t) + sizeof(uintptr_t);
 		const uint16_t realMax = static_cast<uint16_t>(realMaxPlayers());
-		const uint16_t currentValue = active_ ? static_cast<uint16_t>(std::clamp<int>(advertisedSlots_ + currentBotPlayers(), 0, realMax)) : realMax;
+		const uint16_t currentValue = patchedInternalSlots_ ? patchedInternalSlots_ : realMax;
+		const uint16_t desiredValue = active_ ? static_cast<uint16_t>(std::clamp<int>(advertisedSlots_ + currentBotPlayers(), 0, realMax)) : realMax;
 
 		for (size_t offset = 0; offset + QueryMaxPlayersOffset + sizeof(uint16_t) < window.length; ++offset)
 		{
@@ -466,7 +470,7 @@ private:
 			const size_t candidateOffset = offset + QueryMaxPlayersOffset;
 			uint16_t candidate;
 			std::memcpy(&candidate, window.data + candidateOffset, sizeof(candidate));
-			if (candidate == realMax || candidate == currentValue)
+			if (candidate == realMax || candidate == currentValue || candidate == desiredValue)
 			{
 				return reinterpret_cast<uint16_t*>(window.data + candidateOffset);
 			}
