@@ -20,7 +20,7 @@ private:
 
 public:
 	// Visit https://open.mp/uid to generate a new unique ID.
-	PROVIDE_UID(/* UID GOES HERE */);
+	PROVIDE_UID(0xF29375EED05A94E5);
 
 	// When this component is destroyed we need to tell any linked components this it is gone.
 	~EmptyTemplate()
