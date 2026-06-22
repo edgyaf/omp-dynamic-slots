@@ -135,6 +135,7 @@ Returns `true` if the InitGame hostname override is currently active.
 ```pawn
 #include <open.mp>
 #include <advanced_query>
+#include <YSI_Data\y_iterate>
 
 public OnGameModeInit()
 {
@@ -146,7 +147,7 @@ public OnGameModeInit()
 public OnPlayerConnect(playerid)
 {
     // Raise the public query capacity during runtime.
-    if (GetPlayerPoolSize() >= 90)
+    if (Iter_Count(Player) >= 90)
     {
         SetQueryMaxPlayers(110);
     }
@@ -167,7 +168,7 @@ public OnPlayerConnect(playerid)
 Clone with submodules:
 
 ```bash
-git clone --recursive <repo-url>
+git clone --recursive https://github.com/edgyaf/omp-advanced-query.git
 ```
 
 Configure and build with CMake.
