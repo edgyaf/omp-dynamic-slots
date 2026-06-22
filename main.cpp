@@ -24,10 +24,11 @@
 #include <Server/Components/Pawn/Impl/pawn_impl.hpp>
 #include "bitstream.hpp"
 
-class AdvancedQueryComponent final : public IComponent, public PawnEventHandler, public PlayerConnectEventHandler, public NetworkOutEventHandler
+class AdvancedQueryComponent final : public IComponent, public CoreEventHandler, public PawnEventHandler, public PlayerConnectEventHandler, public NetworkOutEventHandler
 {
 private:
 	static constexpr int PlayerInitRpc = 139;
+	static constexpr int QueryPatchRetryTicks = 200;
 	static constexpr size_t MaxInitGameHostname = 64;
 	static constexpr size_t VehicleModelCount = 212;
 
@@ -63,6 +64,12 @@ private:
 		bool enableVehicleFriendlyFire = false;
 	};
 
+	struct MemoryWindow
+	{
+		unsigned char* data = nullptr;
+		size_t length = 0;
+	};
+
 	static AdvancedQueryComponent* self_;
 
 	ICore* core_ = nullptr;
@@ -73,6 +80,8 @@ private:
 	Impl::String initGameHostname_;
 	bool initGameHostnameActive_ = false;
 	bool networkHandlersRegistered_ = false;
+	bool queryPatchPending_ = false;
+	int queryPatchRetriesLeft_ = 0;
 	bool warnedNoLegacyNetwork_ = false;
 	bool warnedQueryPatchFailed_ = false;
 
@@ -92,6 +101,7 @@ public:
 		}
 		if (core_)
 		{
+			core_->getEventDispatcher().removeEventHandler(this);
 			core_->getPlayers().getPlayerConnectDispatcher().removeEventHandler(this);
 			removeNetworkHandlers();
 		}
@@ -119,6 +129,7 @@ public:
 	void onLoad(ICore* core) override
 	{
 		core_ = core;
+		core_->getEventDispatcher().addEventHandler(this);
 		core_->getPlayers().getPlayerConnectDispatcher().addEventHandler(this, EventPriority_Lowest);
 		setAmxLookups(core_);
 	}
@@ -159,6 +170,32 @@ public:
 	{
 	}
 
+	void onTick(Microseconds elapsed, TimePoint now) override
+	{
+		if (!queryPatchPending_)
+		{
+			return;
+		}
+
+		if (applyAdvertisedSlots(active_ ? advertisedSlots_ : publicMaxPlayersLimit(), false))
+		{
+			queryPatchPending_ = false;
+			queryPatchRetriesLeft_ = 0;
+			return;
+		}
+
+		if (queryPatchRetriesLeft_ > 0)
+		{
+			--queryPatchRetriesLeft_;
+		}
+		if (queryPatchRetriesLeft_ == 0 && !warnedQueryPatchFailed_)
+		{
+			core_->logLn(LogLevel::Warning, "Advanced Query could not locate LegacyNetwork query data in this open.mp build.");
+			warnedQueryPatchFailed_ = true;
+			queryPatchPending_ = false;
+		}
+	}
+
 	void onPlayerConnect(IPlayer& player) override
 	{
 		refreshAdvertisedSlots();
@@ -188,7 +225,7 @@ public:
 		active_ = false;
 		requestedSlots_ = 0;
 		advertisedSlots_ = 0;
-		applyAdvertisedSlots(publicMaxPlayersLimit());
+		applyAdvertisedSlotsOrRetry(publicMaxPlayersLimit());
 	}
 
 	int setAdvertisedSlots(int slots)
@@ -203,14 +240,10 @@ public:
 		const int publicMaxPlayers = publicMaxPlayersLimit();
 		const int requested = std::clamp(slots, 0, publicMaxPlayers);
 		const int clamped = std::max(requested, humanPlayers);
-		if (!applyAdvertisedSlots(clamped))
-		{
-			return 0;
-		}
-
 		requestedSlots_ = static_cast<uint16_t>(requested);
 		advertisedSlots_ = static_cast<uint16_t>(clamped);
 		active_ = requested != publicMaxPlayers;
+		applyAdvertisedSlotsOrRetry(clamped);
 		return clamped;
 	}
 
@@ -222,7 +255,7 @@ public:
 	int resetAdvertisedSlots()
 	{
 		const int publicMaxPlayers = publicMaxPlayersLimit();
-		if (publicMaxPlayers <= 0 || !applyAdvertisedSlots(publicMaxPlayers))
+		if (publicMaxPlayers <= 0)
 		{
 			return 0;
 		}
@@ -230,6 +263,7 @@ public:
 		active_ = false;
 		requestedSlots_ = static_cast<uint16_t>(publicMaxPlayers);
 		advertisedSlots_ = static_cast<uint16_t>(publicMaxPlayers);
+		applyAdvertisedSlotsOrRetry(publicMaxPlayers);
 		return publicMaxPlayers;
 	}
 
@@ -302,10 +336,8 @@ private:
 		const int publicMaxPlayers = publicMaxPlayersLimit();
 		const int humanPlayers = std::max(0, currentHumanPlayers() - disconnectingHumanPlayers);
 		const int clamped = std::clamp<int>(std::max<int>(requestedSlots_, humanPlayers), 0, publicMaxPlayers);
-		if (applyAdvertisedSlots(clamped))
-		{
-			advertisedSlots_ = static_cast<uint16_t>(clamped);
-		}
+		advertisedSlots_ = static_cast<uint16_t>(clamped);
+		applyAdvertisedSlotsOrRetry(clamped);
 	}
 
 	int realMaxPlayers() const
@@ -339,7 +371,21 @@ private:
 		return std::max(0, realMaxPlayers() - currentBotPlayers());
 	}
 
-	bool applyAdvertisedSlots(int slots)
+	bool applyAdvertisedSlotsOrRetry(int slots)
+	{
+		if (applyAdvertisedSlots(slots, false))
+		{
+			queryPatchPending_ = false;
+			queryPatchRetriesLeft_ = 0;
+			return true;
+		}
+
+		queryPatchPending_ = true;
+		queryPatchRetriesLeft_ = QueryPatchRetryTicks;
+		return false;
+	}
+
+	bool applyAdvertisedSlots(int slots, bool warn)
 	{
 		if (!core_)
 		{
@@ -365,12 +411,12 @@ private:
 			}
 		}
 
-		if (!foundLegacyNetwork && !warnedNoLegacyNetwork_)
+		if (warn && !foundLegacyNetwork && !warnedNoLegacyNetwork_)
 		{
 			core_->logLn(LogLevel::Warning, "Advanced Query could not find a RakNet legacy network to patch query slots.");
 			warnedNoLegacyNetwork_ = true;
 		}
-		else if (foundLegacyNetwork && !patched && !warnedQueryPatchFailed_)
+		else if (warn && foundLegacyNetwork && !patched && !warnedQueryPatchFailed_)
 		{
 			core_->logLn(LogLevel::Warning, "Advanced Query could not locate LegacyNetwork query data in this open.mp build.");
 			warnedQueryPatchFailed_ = true;
@@ -381,17 +427,37 @@ private:
 
 	uint16_t* findLegacyQueryMaxPlayers(INetwork& network) const
 	{
+		auto* completeObject = static_cast<unsigned char*>(dynamic_cast<void*>(&network));
+		if (uint16_t* value = findLegacyQueryMaxPlayersInWindow(memoryWindow(completeObject, 0, 65536)))
+		{
+			return value;
+		}
+
+		auto* networkInterface = reinterpret_cast<unsigned char*>(&network);
+		if (networkInterface != completeObject)
+		{
+			return findLegacyQueryMaxPlayersInWindow(memoryWindow(networkInterface, 4096, 65536));
+		}
+
+		return nullptr;
+	}
+
+	uint16_t* findLegacyQueryMaxPlayersInWindow(MemoryWindow window) const
+	{
+		if (!window.data || window.length == 0)
+		{
+			return nullptr;
+		}
+
 		const uintptr_t expectedCore = reinterpret_cast<uintptr_t>(core_);
-		auto* bytes = static_cast<unsigned char*>(dynamic_cast<void*>(&network));
-		const size_t scanBytes = readableMemoryLength(bytes, 65536);
 		constexpr size_t QueryMaxPlayersOffset = sizeof(uintptr_t) + sizeof(uintptr_t);
 		const uint16_t realMax = static_cast<uint16_t>(realMaxPlayers());
 		const uint16_t currentValue = active_ ? static_cast<uint16_t>(std::clamp<int>(advertisedSlots_ + currentBotPlayers(), 0, realMax)) : realMax;
 
-		for (size_t offset = 0; offset + QueryMaxPlayersOffset + sizeof(uint16_t) < scanBytes; ++offset)
+		for (size_t offset = 0; offset + QueryMaxPlayersOffset + sizeof(uint16_t) < window.length; ++offset)
 		{
 			uintptr_t queryCore;
-			std::memcpy(&queryCore, bytes + offset, sizeof(queryCore));
+			std::memcpy(&queryCore, window.data + offset, sizeof(queryCore));
 			if (queryCore != expectedCore)
 			{
 				continue;
@@ -399,28 +465,28 @@ private:
 
 			const size_t candidateOffset = offset + QueryMaxPlayersOffset;
 			uint16_t candidate;
-			std::memcpy(&candidate, bytes + candidateOffset, sizeof(candidate));
+			std::memcpy(&candidate, window.data + candidateOffset, sizeof(candidate));
 			if (candidate == realMax || candidate == currentValue)
 			{
-				return reinterpret_cast<uint16_t*>(bytes + candidateOffset);
+				return reinterpret_cast<uint16_t*>(window.data + candidateOffset);
 			}
 		}
 
 		return nullptr;
 	}
 
-	size_t readableMemoryLength(const void* address, size_t maxLength) const
+	MemoryWindow memoryWindow(const void* address, size_t bytesBefore, size_t bytesAfter) const
 	{
-		if (!address || maxLength == 0)
+		if (!address || (bytesBefore == 0 && bytesAfter == 0))
 		{
-			return 0;
+			return {};
 		}
 
 #if OMP_BUILD_PLATFORM == OMP_WINDOWS
 		MEMORY_BASIC_INFORMATION mbi {};
 		if (!VirtualQuery(address, &mbi, sizeof(mbi)))
 		{
-			return 0;
+			return {};
 		}
 
 		const auto start = reinterpret_cast<uintptr_t>(address);
@@ -428,14 +494,18 @@ private:
 		const auto regionEnd = regionStart + mbi.RegionSize;
 		if (mbi.State != MEM_COMMIT || start < regionStart || start >= regionEnd || !hasReadableProtection(mbi.Protect))
 		{
-			return 0;
+			return {};
 		}
-		return std::min(maxLength, static_cast<size_t>(regionEnd - start));
+
+		const uintptr_t windowStart = start - std::min(bytesBefore, static_cast<size_t>(start - regionStart));
+		const uintptr_t requestedEnd = start + bytesAfter;
+		const uintptr_t windowEnd = std::min(requestedEnd, regionEnd);
+		return { reinterpret_cast<unsigned char*>(windowStart), static_cast<size_t>(windowEnd - windowStart) };
 #else
 		std::ifstream maps("/proc/self/maps");
 		if (!maps)
 		{
-			return 0;
+			return {};
 		}
 
 		const auto start = reinterpret_cast<uintptr_t>(address);
@@ -460,10 +530,13 @@ private:
 			const uintptr_t regionEnd = static_cast<uintptr_t>(std::stoull(range.substr(dash + 1), nullptr, 16));
 			if (start >= regionStart && start < regionEnd && !perms.empty() && perms[0] == 'r')
 			{
-				return std::min(maxLength, static_cast<size_t>(regionEnd - start));
+				const uintptr_t windowStart = start - std::min(bytesBefore, static_cast<size_t>(start - regionStart));
+				const uintptr_t requestedEnd = start + bytesAfter;
+				const uintptr_t windowEnd = std::min(requestedEnd, regionEnd);
+				return { reinterpret_cast<unsigned char*>(windowStart), static_cast<size_t>(windowEnd - windowStart) };
 			}
 		}
-		return 0;
+		return {};
 #endif
 	}
 
