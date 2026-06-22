@@ -491,7 +491,7 @@ private:
 
 		const auto start = reinterpret_cast<uintptr_t>(address);
 		const auto regionStart = reinterpret_cast<uintptr_t>(mbi.BaseAddress);
-		const auto regionEnd = regionStart + mbi.RegionSize;
+		const uintptr_t regionEnd = regionStart + static_cast<uintptr_t>(mbi.RegionSize);
 		if (mbi.State != MEM_COMMIT || start < regionStart || start >= regionEnd || !hasReadableProtection(mbi.Protect))
 		{
 			return {};
