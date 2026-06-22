@@ -188,7 +188,7 @@ public:
 		active_ = false;
 		requestedSlots_ = 0;
 		advertisedSlots_ = 0;
-		applyAdvertisedSlots(realMaxPlayers());
+		applyAdvertisedSlots(publicMaxPlayersLimit());
 	}
 
 	int setAdvertisedSlots(int slots)
@@ -199,9 +199,10 @@ public:
 			return 0;
 		}
 
-		const int playerCount = currentHumanPlayers();
-		const int requested = std::clamp(slots, 0, maxPlayers);
-		const int clamped = std::max(requested, playerCount);
+		const int humanPlayers = currentHumanPlayers();
+		const int publicMaxPlayers = publicMaxPlayersLimit();
+		const int requested = std::clamp(slots, 0, publicMaxPlayers);
+		const int clamped = std::max(requested, humanPlayers);
 		if (!applyAdvertisedSlots(clamped))
 		{
 			return 0;
@@ -209,27 +210,27 @@ public:
 
 		requestedSlots_ = static_cast<uint16_t>(requested);
 		advertisedSlots_ = static_cast<uint16_t>(clamped);
-		active_ = requested != maxPlayers;
+		active_ = requested != publicMaxPlayers;
 		return clamped;
 	}
 
 	int getAdvertisedSlots() const
 	{
-		return active_ ? advertisedSlots_ : realMaxPlayers();
+		return active_ ? advertisedSlots_ : publicMaxPlayersLimit();
 	}
 
 	int resetAdvertisedSlots()
 	{
-		const int maxPlayers = realMaxPlayers();
-		if (maxPlayers <= 0 || !applyAdvertisedSlots(maxPlayers))
+		const int publicMaxPlayers = publicMaxPlayersLimit();
+		if (publicMaxPlayers <= 0 || !applyAdvertisedSlots(publicMaxPlayers))
 		{
 			return 0;
 		}
 
 		active_ = false;
-		requestedSlots_ = static_cast<uint16_t>(maxPlayers);
-		advertisedSlots_ = static_cast<uint16_t>(maxPlayers);
-		return maxPlayers;
+		requestedSlots_ = static_cast<uint16_t>(publicMaxPlayers);
+		advertisedSlots_ = static_cast<uint16_t>(publicMaxPlayers);
+		return publicMaxPlayers;
 	}
 
 	bool setInitGameHostname(StringView hostname)
@@ -298,9 +299,9 @@ private:
 			return;
 		}
 
-		const int maxPlayers = realMaxPlayers();
-		const int playerCount = std::max(0, currentHumanPlayers() - disconnectingHumanPlayers);
-		const int clamped = std::clamp<int>(std::max<int>(requestedSlots_, playerCount), 0, maxPlayers);
+		const int publicMaxPlayers = publicMaxPlayersLimit();
+		const int humanPlayers = std::max(0, currentHumanPlayers() - disconnectingHumanPlayers);
+		const int clamped = std::clamp<int>(std::max<int>(requestedSlots_, humanPlayers), 0, publicMaxPlayers);
 		if (applyAdvertisedSlots(clamped))
 		{
 			advertisedSlots_ = static_cast<uint16_t>(clamped);
@@ -320,7 +321,22 @@ private:
 
 	int currentHumanPlayers() const
 	{
+		return std::max(0, currentTotalPlayers() - currentBotPlayers());
+	}
+
+	int currentTotalPlayers() const
+	{
 		return core_ ? static_cast<int>(core_->getPlayers().players().size()) : 0;
+	}
+
+	int currentBotPlayers() const
+	{
+		return core_ ? static_cast<int>(core_->getPlayers().bots().size()) : 0;
+	}
+
+	int publicMaxPlayersLimit() const
+	{
+		return std::max(0, realMaxPlayers() - currentBotPlayers());
 	}
 
 	bool applyAdvertisedSlots(int slots)
@@ -330,6 +346,7 @@ private:
 			return false;
 		}
 
+		const int internalSlots = std::clamp(slots + currentBotPlayers(), 0, realMaxPlayers());
 		bool patched = false;
 		bool foundLegacyNetwork = false;
 		for (INetwork* network : core_->getNetworks())
@@ -342,12 +359,10 @@ private:
 
 			if (uint16_t* queryMaxPlayers = findLegacyQueryMaxPlayers(*network))
 			{
-				*queryMaxPlayers = static_cast<uint16_t>(slots);
+				*queryMaxPlayers = static_cast<uint16_t>(internalSlots);
 				network->update();
 				patched = true;
 			}
-
-			patched = patchLegacyQueryInfoBuffer(*network, static_cast<uint16_t>(slots)) || patched;
 		}
 
 		if (!foundLegacyNetwork && !warnedNoLegacyNetwork_)
@@ -368,11 +383,13 @@ private:
 	{
 		const uintptr_t expectedCore = reinterpret_cast<uintptr_t>(core_);
 		auto* bytes = static_cast<unsigned char*>(dynamic_cast<void*>(&network));
-		constexpr size_t ScanBytes = 65536;
+		const size_t scanBytes = readableMemoryLength(bytes, 65536);
 		constexpr size_t QueryHeaderSearchBytes = 64;
 		constexpr size_t QueryMaxPlayersOffset = sizeof(uintptr_t) + sizeof(uintptr_t);
+		const uint16_t realMax = static_cast<uint16_t>(realMaxPlayers());
+		const uint16_t currentValue = active_ ? static_cast<uint16_t>(std::clamp<int>(advertisedSlots_ + currentBotPlayers(), 0, realMax)) : realMax;
 
-		for (size_t offset = 0; offset + sizeof(uintptr_t) < ScanBytes; ++offset)
+		for (size_t offset = 0; offset + sizeof(uintptr_t) < scanBytes; ++offset)
 		{
 			uintptr_t first;
 			std::memcpy(&first, bytes + offset, sizeof(first));
@@ -381,7 +398,7 @@ private:
 				continue;
 			}
 
-			const size_t searchEnd = std::min(offset + QueryHeaderSearchBytes, ScanBytes - sizeof(uint16_t));
+			const size_t searchEnd = std::min(offset + QueryHeaderSearchBytes, scanBytes - sizeof(uint16_t));
 			for (size_t secondOffset = offset + 1; secondOffset + sizeof(uintptr_t) < searchEnd; ++secondOffset)
 			{
 				uintptr_t second;
@@ -392,9 +409,14 @@ private:
 				}
 
 				const size_t candidateOffset = secondOffset + QueryMaxPlayersOffset;
-				if (candidateOffset + sizeof(uint16_t) < ScanBytes)
+				if (candidateOffset + sizeof(uint16_t) < scanBytes)
 				{
-					return reinterpret_cast<uint16_t*>(bytes + candidateOffset);
+					uint16_t candidate;
+					std::memcpy(&candidate, bytes + candidateOffset, sizeof(candidate));
+					if (candidate == realMax || candidate == currentValue)
+					{
+						return reinterpret_cast<uint16_t*>(bytes + candidateOffset);
+					}
 				}
 			}
 		}
@@ -402,91 +424,36 @@ private:
 		return nullptr;
 	}
 
-	bool patchLegacyQueryInfoBuffer(INetwork& network, uint16_t slots) const
+	size_t readableMemoryLength(const void* address, size_t maxLength) const
 	{
-		auto* bytes = static_cast<unsigned char*>(dynamic_cast<void*>(&network));
-		constexpr size_t ScanBytes = 65536;
-		constexpr size_t MinInfoBufferSize = 16;
-		constexpr size_t MaxInfoBufferSize = 4096;
-		constexpr size_t QueryTypeOffset = 10;
-		constexpr size_t QueryPasswordedOffset = 11;
-		constexpr size_t QueryPlayerCountOffset = 12;
-		constexpr size_t QueryMaxPlayersOffset = 14;
-
-		bool patched = false;
-		for (size_t offset = 0; offset + sizeof(uintptr_t) + sizeof(size_t) < ScanBytes; ++offset)
+		if (!address || maxLength == 0)
 		{
-			uintptr_t pointerValue = 0;
-			std::memcpy(&pointerValue, bytes + offset, sizeof(pointerValue));
-			auto* buffer = reinterpret_cast<unsigned char*>(pointerValue);
-
-			size_t bufferLength = 0;
-			std::memcpy(&bufferLength, bytes + offset + sizeof(pointerValue), sizeof(bufferLength));
-			if (bufferLength < MinInfoBufferSize || bufferLength > MaxInfoBufferSize)
-			{
-				continue;
-			}
-			if (!isReadableMemory(buffer, bufferLength))
-			{
-				continue;
-			}
-			if (buffer[QueryTypeOffset] != 'i' || buffer[QueryPasswordedOffset] > 1)
-			{
-				continue;
-			}
-
-			uint16_t playerCount = 0;
-			std::memcpy(&playerCount, buffer + QueryPlayerCountOffset, sizeof(playerCount));
-			if (playerCount > slots)
-			{
-				continue;
-			}
-
-			std::memcpy(buffer + QueryMaxPlayersOffset, &slots, sizeof(slots));
-			patched = true;
-		}
-
-		return patched;
-	}
-
-	bool isReadableMemory(const void* address, size_t length) const
-	{
-		if (!address || length == 0)
-		{
-			return false;
+			return 0;
 		}
 
 #if OMP_BUILD_PLATFORM == OMP_WINDOWS
 		MEMORY_BASIC_INFORMATION mbi {};
 		if (!VirtualQuery(address, &mbi, sizeof(mbi)))
 		{
-			return false;
+			return 0;
 		}
 
 		const auto start = reinterpret_cast<uintptr_t>(address);
 		const auto regionStart = reinterpret_cast<uintptr_t>(mbi.BaseAddress);
 		const auto regionEnd = regionStart + mbi.RegionSize;
-		if (mbi.State != MEM_COMMIT || start < regionStart || start + length > regionEnd)
+		if (mbi.State != MEM_COMMIT || start < regionStart || start >= regionEnd || !hasReadableProtection(mbi.Protect))
 		{
-			return false;
+			return 0;
 		}
-
-		const DWORD protect = mbi.Protect & 0xff;
-		return protect == PAGE_READONLY
-			|| protect == PAGE_READWRITE
-			|| protect == PAGE_WRITECOPY
-			|| protect == PAGE_EXECUTE_READ
-			|| protect == PAGE_EXECUTE_READWRITE
-			|| protect == PAGE_EXECUTE_WRITECOPY;
+		return std::min(maxLength, static_cast<size_t>(regionEnd - start));
 #else
 		std::ifstream maps("/proc/self/maps");
 		if (!maps)
 		{
-			return false;
+			return 0;
 		}
 
 		const auto start = reinterpret_cast<uintptr_t>(address);
-		const auto end = start + length;
 		Impl::String line;
 		while (std::getline(maps, line))
 		{
@@ -506,14 +473,37 @@ private:
 
 			const uintptr_t regionStart = static_cast<uintptr_t>(std::stoull(range.substr(0, dash), nullptr, 16));
 			const uintptr_t regionEnd = static_cast<uintptr_t>(std::stoull(range.substr(dash + 1), nullptr, 16));
-			if (start >= regionStart && end <= regionEnd)
+			if (start >= regionStart && start < regionEnd && !perms.empty() && perms[0] == 'r')
 			{
-				return !perms.empty() && perms[0] == 'r' && perms.size() > 1 && perms[1] == 'w';
+				return std::min(maxLength, static_cast<size_t>(regionEnd - start));
 			}
 		}
-		return false;
+		return 0;
 #endif
 	}
+
+#if OMP_BUILD_PLATFORM == OMP_WINDOWS
+	bool hasReadableProtection(DWORD protect) const
+	{
+		if (protect & (PAGE_GUARD | PAGE_NOACCESS))
+		{
+			return false;
+		}
+
+		switch (protect & 0xff)
+		{
+		case PAGE_READONLY:
+		case PAGE_READWRITE:
+		case PAGE_WRITECOPY:
+		case PAGE_EXECUTE_READ:
+		case PAGE_EXECUTE_READWRITE:
+		case PAGE_EXECUTE_WRITECOPY:
+			return true;
+		default:
+			return false;
+		}
+	}
+#endif
 
 	bool readPlayerInit(NetworkBitStream& bs, PlayerInitData& data) const
 	{
