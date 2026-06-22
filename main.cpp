@@ -10,83 +10,13 @@
 #include <array>
 #include <cstdint>
 #include <cstring>
-#include <iterator>
 #include <limits>
+#include <string>
 
+#include <Server/Components/Pawn/pawn.hpp>
+#include <Server/Components/Pawn/Impl/pawn_natives.hpp>
+#include <Server/Components/Pawn/Impl/pawn_impl.hpp>
 #include "bitstream.hpp"
-
-using cell = int32_t;
-struct AMX;
-using AMX_NATIVE = cell(__CDECL*)(AMX*, const cell*);
-
-struct AMX_NATIVE_INFO
-{
-	const char* name;
-	AMX_NATIVE func;
-};
-
-struct IPawnScript
-{
-	virtual int Allot(int cells, cell* amx_addr, cell** phys_addr) = 0;
-	virtual int Callback(cell index, cell* result, const cell* params) = 0;
-	virtual int Cleanup() = 0;
-	virtual int Clone(AMX* amxClone, void* data) const = 0;
-	virtual int Exec(cell* retval, int index) = 0;
-	virtual int FindNative(char const* name, int* index) const = 0;
-	virtual int FindPublic(char const* funcname, int* index) const = 0;
-	virtual int FindPubVar(char const* varname, cell* amx_addr) const = 0;
-	virtual int FindTagId(cell tag_id, char* tagname) const = 0;
-	virtual int Flags(uint16_t* flags) const = 0;
-	virtual int GetAddr(cell amx_addr, cell** phys_addr) const = 0;
-	virtual int GetNative(int index, char* funcname) const = 0;
-	virtual int GetNativeByIndex(int index, AMX_NATIVE_INFO* ret) const = 0;
-	virtual int GetPublic(int index, char* funcname) const = 0;
-	virtual int GetPubVar(int index, char* varname, cell* amx_addr) const = 0;
-	virtual int GetString(char const* dest, const cell* source, bool use_wchar, size_t size) const = 0;
-	virtual int GetString(char* dest, const cell* source, bool use_wchar, size_t size) = 0;
-	virtual int GetTag(int index, char* tagname, cell* tag_id) const = 0;
-	virtual int GetUserData(long tag, void** ptr) const = 0;
-	virtual int Init(void* program) = 0;
-	virtual int InitJIT(void* reloc_table, void* native_code) = 0;
-	virtual int MakeAddr(cell* phys_addr, cell* amx_addr) const = 0;
-	virtual int MemInfo(long* codesize, long* datasize, long* stackheap) const = 0;
-	virtual int NameLength(int* length) const = 0;
-	virtual AMX_NATIVE_INFO* NativeInfo(char const* name, AMX_NATIVE func) const = 0;
-	virtual int NumNatives(int* number) const = 0;
-	virtual int NumPublics(int* number) const = 0;
-	virtual int NumPubVars(int* number) const = 0;
-	virtual int NumTags(int* number) const = 0;
-	virtual int Push(cell value) = 0;
-	virtual int PushArray(cell* amx_addr, cell** phys_addr, const cell array[], int numcells) = 0;
-	virtual int PushString(cell* amx_addr, cell** phys_addr, StringView string, bool pack, bool use_wchar) = 0;
-	virtual int RaiseError(int error) = 0;
-	virtual int Register(const AMX_NATIVE_INFO* nativelist, int number) = 0;
-	virtual int Release(cell amx_addr) = 0;
-	virtual int SetCallback(void* callback) = 0;
-	virtual int SetDebugHook(void* debug) = 0;
-	virtual int SetString(cell* dest, StringView source, bool pack, bool use_wchar, size_t size) const = 0;
-	virtual int SetUserData(long tag, void* ptr) = 0;
-	virtual int StrLen(const cell* cstring, int* length) const = 0;
-};
-
-struct PawnEventHandler
-{
-	virtual void onAmxLoad(IPawnScript& script) = 0;
-	virtual void onAmxUnload(IPawnScript& script) = 0;
-};
-
-static const UID PawnComponent_UID = UID(0x78906cd9f19c36a6);
-struct IPawnComponent : public IComponent
-{
-	PROVIDE_UID(PawnComponent_UID);
-
-	virtual IEventDispatcher<PawnEventHandler>& getEventDispatcher() = 0;
-	virtual const StaticArray<void*, 52>& getAmxFunctions() const = 0;
-	virtual IPawnScript const* getScript(AMX* amx) const = 0;
-	virtual IPawnScript* getScript(AMX* amx) = 0;
-	virtual IPawnScript* mainScript() = 0;
-	virtual const Span<IPawnScript*> sideScripts() = 0;
-};
 
 class AdvancedQueryComponent final : public IComponent, public PawnEventHandler, public PlayerConnectEventHandler, public NetworkOutEventHandler
 {
@@ -173,10 +103,16 @@ public:
 		return SemanticVersion(1, 0, 0, 0);
 	}
 
+	static AdvancedQueryComponent* instance()
+	{
+		return self_;
+	}
+
 	void onLoad(ICore* core) override
 	{
 		core_ = core;
 		core_->getPlayers().getPlayerConnectDispatcher().addEventHandler(this);
+		setAmxLookups(core_);
 	}
 
 	void onInit(IComponentList* components) override
@@ -184,6 +120,8 @@ public:
 		pawn_ = components->queryComponent<IPawnComponent>();
 		if (pawn_)
 		{
+			setAmxFunctions(pawn_->getAmxFunctions());
+			setAmxLookups(components);
 			pawn_->getEventDispatcher().addEventHandler(this);
 		}
 	}
@@ -191,23 +129,6 @@ public:
 	void onReady() override
 	{
 		addNetworkHandlers();
-
-		if (!pawn_)
-		{
-			return;
-		}
-
-		if (IPawnScript* script = pawn_->mainScript())
-		{
-			registerNatives(*script);
-		}
-		for (IPawnScript* script : pawn_->sideScripts())
-		{
-			if (script)
-			{
-				registerNatives(*script);
-			}
-		}
 	}
 
 	void onFree(IComponent* component) override
@@ -216,12 +137,14 @@ public:
 		{
 			pawn_->getEventDispatcher().removeEventHandler(this);
 			pawn_ = nullptr;
+			setAmxFunctions();
+			setAmxLookups();
 		}
 	}
 
 	void onAmxLoad(IPawnScript& script) override
 	{
-		registerNatives(script);
+		pawn_natives::AmxLoad(script.GetAMX());
 	}
 
 	void onAmxUnload(IPawnScript& script) override
@@ -376,27 +299,6 @@ private:
 		}
 	}
 
-	void registerNatives(IPawnScript& script)
-	{
-		static const AMX_NATIVE_INFO natives[] = {
-			{ "SetQueryMaxPlayers", &SetQueryMaxPlayers },
-			{ "GetQueryMaxPlayers", &GetQueryMaxPlayers },
-			{ "ResetQueryMaxPlayers", &ResetQueryMaxPlayers },
-			{ "SetInitGameHostname", &SetInitGameHostname },
-			{ "ResetInitGameHostname", &ResetInitGameHostname },
-			{ "IsInitGameHostnameSet", &IsInitGameHostnameSet },
-		};
-
-		for (const AMX_NATIVE_INFO& native : natives)
-		{
-			int index = 0;
-			if (script.FindNative(native.name, &index) != 0)
-			{
-				script.Register(&native, 1);
-			}
-		}
-	}
-
 	int realMaxPlayers() const
 	{
 		if (!core_)
@@ -539,88 +441,6 @@ private:
 			writePlayerInit(bs, data, StringView(initGameHostname_.data(), initGameHostname_.length()));
 		}
 	}
-
-	bool readPawnString(AMX* amx, cell address, Impl::String& output, size_t maxLen) const
-	{
-		if (!pawn_)
-		{
-			return false;
-		}
-
-		IPawnScript* script = pawn_->getScript(amx);
-		if (!script)
-		{
-			return false;
-		}
-
-		cell* phys = nullptr;
-		if (script->GetAddr(address, &phys) != 0 || !phys)
-		{
-			return false;
-		}
-
-		int length = 0;
-		if (script->StrLen(phys, &length) != 0 || length < 0)
-		{
-			return false;
-		}
-
-		const size_t safeLength = std::min<size_t>(static_cast<size_t>(length), maxLen);
-		Impl::String buffer;
-		buffer.resize(safeLength + 1);
-		if (script->GetString(buffer.data(), phys, false, safeLength + 1) != 0)
-		{
-			return false;
-		}
-
-		buffer.resize(std::strlen(buffer.c_str()));
-		output = buffer;
-		return true;
-	}
-
-	static cell __CDECL SetQueryMaxPlayers(AMX*, const cell* params)
-	{
-		if (!self_ || params[0] < static_cast<cell>(sizeof(cell)))
-		{
-			return 0;
-		}
-		return self_->setAdvertisedSlots(params[1]);
-	}
-
-	static cell __CDECL GetQueryMaxPlayers(AMX*, const cell*)
-	{
-		return self_ ? self_->getAdvertisedSlots() : 0;
-	}
-
-	static cell __CDECL ResetQueryMaxPlayers(AMX*, const cell*)
-	{
-		return self_ ? self_->resetAdvertisedSlots() : 0;
-	}
-
-	static cell __CDECL SetInitGameHostname(AMX* amx, const cell* params)
-	{
-		if (!self_ || params[0] < static_cast<cell>(sizeof(cell)))
-		{
-			return 0;
-		}
-
-		Impl::String hostname;
-		if (!self_->readPawnString(amx, params[1], hostname, MaxInitGameHostname))
-		{
-			return 0;
-		}
-		return self_->setInitGameHostname(StringView(hostname.data(), hostname.length())) ? 1 : 0;
-	}
-
-	static cell __CDECL ResetInitGameHostname(AMX*, const cell*)
-	{
-		return self_ && self_->resetInitGameHostname() ? 1 : 0;
-	}
-
-	static cell __CDECL IsInitGameHostnameSet(AMX*, const cell*)
-	{
-		return self_ && self_->hasInitGameHostname() ? 1 : 0;
-	}
 };
 
 AdvancedQueryComponent* AdvancedQueryComponent::self_ = nullptr;
@@ -628,4 +448,58 @@ AdvancedQueryComponent* AdvancedQueryComponent::self_ = nullptr;
 COMPONENT_ENTRY_POINT()
 {
 	return new AdvancedQueryComponent();
+}
+
+SCRIPT_API(SetQueryMaxPlayers, int(int slots))
+{
+	if (AdvancedQueryComponent* component = AdvancedQueryComponent::instance())
+	{
+		return component->setAdvertisedSlots(slots);
+	}
+	return 0;
+}
+
+SCRIPT_API(GetQueryMaxPlayers, int())
+{
+	if (AdvancedQueryComponent* component = AdvancedQueryComponent::instance())
+	{
+		return component->getAdvertisedSlots();
+	}
+	return 0;
+}
+
+SCRIPT_API(ResetQueryMaxPlayers, int())
+{
+	if (AdvancedQueryComponent* component = AdvancedQueryComponent::instance())
+	{
+		return component->resetAdvertisedSlots();
+	}
+	return 0;
+}
+
+SCRIPT_API(SetInitGameHostname, bool(std::string const& hostname))
+{
+	if (AdvancedQueryComponent* component = AdvancedQueryComponent::instance())
+	{
+		return component->setInitGameHostname(StringView(hostname.data(), hostname.length()));
+	}
+	return false;
+}
+
+SCRIPT_API(ResetInitGameHostname, bool())
+{
+	if (AdvancedQueryComponent* component = AdvancedQueryComponent::instance())
+	{
+		return component->resetInitGameHostname();
+	}
+	return false;
+}
+
+SCRIPT_API(IsInitGameHostnameSet, bool())
+{
+	if (AdvancedQueryComponent* component = AdvancedQueryComponent::instance())
+	{
+		return component->hasInitGameHostname();
+	}
+	return false;
 }

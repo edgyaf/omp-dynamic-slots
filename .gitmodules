@@ -4,3 +4,9 @@
 [submodule "network"]
 	path = network
 	url = https://github.com/openmultiplayer/open.mp-network
+[submodule "pawn"]
+	path = pawn
+	url = https://github.com/openmultiplayer/compiler
+[submodule "pawn-natives"]
+	path = pawn-natives
+	url = https://github.com/openmultiplayer/pawn-natives
