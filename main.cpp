@@ -204,7 +204,7 @@ public:
 
 	void onPlayerDisconnect(IPlayer& player, PeerDisconnectReason reason) override
 	{
-		refreshAdvertisedSlots(player.isBot() ? 0 : 1);
+		refreshAdvertisedSlots(player.isBot() ? 0 : 1, player.isBot() ? 1 : 0);
 	}
 
 	bool onSendRPC(IPlayer* peer, int id, NetworkBitStream& bs) override
@@ -226,7 +226,6 @@ public:
 		active_ = false;
 		requestedSlots_ = 0;
 		advertisedSlots_ = 0;
-		patchedInternalSlots_ = 0;
 		applyAdvertisedSlotsOrRetry(publicMaxPlayersLimit());
 	}
 
@@ -328,18 +327,19 @@ private:
 		networkHandlersRegistered_ = false;
 	}
 
-	void refreshAdvertisedSlots(int disconnectingHumanPlayers = 0)
+	void refreshAdvertisedSlots(int disconnectingHumanPlayers = 0, int disconnectingBotPlayers = 0)
 	{
 		if (!active_)
 		{
 			return;
 		}
 
-		const int publicMaxPlayers = publicMaxPlayersLimit();
+		const int botPlayers = std::max(0, currentBotPlayers() - disconnectingBotPlayers);
+		const int publicMaxPlayers = publicMaxPlayersLimit(botPlayers);
 		const int humanPlayers = std::max(0, currentHumanPlayers() - disconnectingHumanPlayers);
 		const int clamped = std::clamp<int>(std::max<int>(requestedSlots_, humanPlayers), 0, publicMaxPlayers);
 		advertisedSlots_ = static_cast<uint16_t>(clamped);
-		applyAdvertisedSlotsOrRetry(clamped);
+		applyAdvertisedSlotsOrRetry(clamped, botPlayers);
 	}
 
 	int realMaxPlayers() const
@@ -370,12 +370,22 @@ private:
 
 	int publicMaxPlayersLimit() const
 	{
-		return std::max(0, realMaxPlayers() - currentBotPlayers());
+		return publicMaxPlayersLimit(currentBotPlayers());
+	}
+
+	int publicMaxPlayersLimit(int botPlayers) const
+	{
+		return std::max(0, realMaxPlayers() - botPlayers);
 	}
 
 	bool applyAdvertisedSlotsOrRetry(int slots)
 	{
-		if (applyAdvertisedSlots(slots, false))
+		return applyAdvertisedSlotsOrRetry(slots, currentBotPlayers());
+	}
+
+	bool applyAdvertisedSlotsOrRetry(int slots, int botPlayers)
+	{
+		if (applyAdvertisedSlots(slots, botPlayers, false))
 		{
 			queryPatchPending_ = false;
 			queryPatchRetriesLeft_ = 0;
@@ -389,12 +399,17 @@ private:
 
 	bool applyAdvertisedSlots(int slots, bool warn)
 	{
+		return applyAdvertisedSlots(slots, currentBotPlayers(), warn);
+	}
+
+	bool applyAdvertisedSlots(int slots, int botPlayers, bool warn)
+	{
 		if (!core_)
 		{
 			return false;
 		}
 
-		const int internalSlots = std::clamp(slots + currentBotPlayers(), 0, realMaxPlayers());
+		const int internalSlots = std::clamp(slots + botPlayers, 0, realMaxPlayers());
 		bool patched = false;
 		bool foundLegacyNetwork = false;
 		for (INetwork* network : core_->getNetworks())
